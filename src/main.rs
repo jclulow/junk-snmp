@@ -20,7 +20,7 @@ pub struct OidTree {
     nodes: Vec<OidTreeEntry>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum IfOperStatus {
     Up,
     Down,
@@ -203,17 +203,11 @@ impl OidTree {
             }
         };
 
-        //for x in tail {
-        //    println!(" -t- {}", x);
-        //}
-
         loop {
             if let Some(name) = anchor.name.as_deref() {
                 out.push(name.to_string());
-                //println!(" -N- {name:?}");
             } else {
                 out.push(anchor.value.to_string());
-                //println!(" -T- {}", anchor.value);
             }
 
             if anchor.root {
@@ -364,6 +358,7 @@ fn populate_mib() -> Result<OidTree> {
     let mgmt = tree.add_oid_under(&internet, &[2], "mgmt")?;
     let mib_2 = tree.add_oid_under(&mgmt, &[1], "mib-2")?;
     let interfaces = tree.add_oid_under(&mib_2, &[2], "interfaces")?;
+    #[allow(unused)]
     let if_number = tree.add_oid_under(&interfaces, &[1], "ifNumber")?;
     let if_table = tree.add_oid_under(&interfaces, &[2], "ifTable")?;
     let if_entry = tree.add_oid_under(&if_table, &[1], "ifEntry")?;
@@ -476,6 +471,25 @@ fn populate_mib() -> Result<OidTree> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let a = getopts::Options::new()
+        .optflag("v", "", "verbose output")
+        .parsing_style(getopts::ParsingStyle::StopAtFirstFree)
+        .parse(std::env::args().skip(1))?;
+
+    if a.free.len() != 1 {
+        bail!("IP address of switch?");
+    }
+
+    let verbose = a.opt_present("v");
+
+    let addr: std::net::IpAddr = a.free[0].parse()?;
+    println!("using switch address {addr}");
+
+    let bind = match &addr {
+        std::net::IpAddr::V4(_) => "0.0.0.0:0",
+        std::net::IpAddr::V6(_) => "[::]:0",
+    };
+
     let tree = populate_mib()?;
 
     /*
@@ -513,14 +527,20 @@ async fn main() -> Result<()> {
 
     println!("creating client...");
     let c = csnmp::Snmp2cClient::new(
-        "172.20.0.152:161".parse()?,
+        std::net::SocketAddr::new(addr, 161),
         b"muppets".to_vec(),
-        Some("0.0.0.0:0".parse()?),
+        Some(bind.parse()?),
         Some(Duration::from_secs(5)),
     )
     .await?;
 
     println!("walking from {name:?} ({top_oid}) ...");
+
+    fn blank_map() -> BTreeMap<u32, Option<IfOperStatus>> {
+        (1u32..=16).map(|port| (port, None)).collect()
+    }
+
+    let mut oldmap = blank_map();
 
     loop {
         let start = Instant::now();
@@ -547,26 +567,65 @@ async fn main() -> Result<()> {
             }
         }
 
-        println!("{:<20} {}", "PORT", "STATE");
+        /*
+         * We only care about the copper gigabit ports right now.  Start with an
+         * unknown state for each of them:
+         */
+        let mut map = blank_map();
+
+        /*
+         * Look at what we actually got back from the switch and update the map.
+         */
+        if verbose {
+            println!("{:<20} {}", "PORT", "STATE");
+        }
         for (idx, st) in link_states {
             let Some(desc) = link_desc.get(&idx) else { continue; };
             let Some(ltype) = link_types.get(&idx) else { continue; };
 
-            if !matches!(ltype, IfType::EthernetCsmacd)
-                || !desc.starts_with("GigabitEthernet")
-            {
+            if !matches!(ltype, IfType::EthernetCsmacd) {
                 continue;
             }
 
-            println!("{:<20} {:?}", desc, st);
+            let Some(port) = desc.strip_prefix("GigabitEthernet") else {
+                continue;
+            };
+            let Ok(port) = port.parse::<u32>() else { continue; };
+
+            if verbose {
+                println!("{:<20} {:?}", desc, st);
+            }
+
+            map.insert(port, Some(st));
         }
 
-        let delta = Instant::now().saturating_duration_since(start).as_millis();
-        println!("    (took {delta}ms)");
-        println!();
+        if verbose {
+            println!("{map:#?}");
+
+            let delta =
+                Instant::now().saturating_duration_since(start).as_millis();
+            println!("    (took {delta}ms)");
+            println!();
+        }
+
+        let mut banner = false;
+
+        for port in 1u32..=16 {
+            let old = oldmap.get(&port).unwrap();
+            let new = map.get(&port).unwrap();
+
+            if old != new {
+                if !banner {
+                    println!("-------------------------");
+                    banner = true;
+                }
+
+                println!("{port:<2} {old:?} -> {new:?}");
+            }
+        }
+
+        oldmap = map;
 
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-
-    Ok(())
 }
