@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.70"
-csnmp = "0.3.5"
+csnmp = "0.6"
 getopts = "0.2.21"
 tokio = { version = "1.27.0", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

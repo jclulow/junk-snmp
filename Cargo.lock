@@ -70,9 +70,9 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
 name = "csnmp"
-version = "0.3.5"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8502e16468c14ea443e58891534f8f082f07d9f402767f1a32b357bbdddb6dfd"
+checksum = "30da8dba8a9eccc31290275c3803f1a730044029e026bfda5db3538a79d3a4e6"
 dependencies = [
  "derivative",
  "from-to-repr",
@@ -102,13 +102,13 @@ dependencies = [
 
 [[package]]
 name = "from-to-repr"
-version = "0.1.10"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88e7fba119e29cd43fb6af151b1711194b9652ddf3248a640105c7c209354a7b"
+checksum = "c54db632c227d6b430e21ec83b053e7d2313eb1c07715a226b3016e020c15dbd"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 1.0.109",
+ "syn 2.0.58",
 ]
 
 [[package]]

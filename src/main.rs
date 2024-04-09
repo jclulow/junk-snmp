@@ -915,12 +915,13 @@ async fn main() -> Result<()> {
         b"muppets".to_vec(),
         Some(bind.parse()?),
         Some(Duration::from_secs(5)),
+        0,
     )
     .await?;
 
     println!("walking from {name} ({top}) ...");
 
-    let res = RPdu2(&tree, c.walk_bulk(top, 0, 63).await?);
+    let res = RPdu2(&tree, c.walk_bulk(top, 63).await?);
 
     let outlet_status = res.outlet_status()?;
     println!("outlet_status = {outlet_status:#?}");
