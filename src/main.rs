@@ -1,24 +1,19 @@
 use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
+    collections::{BTreeMap, HashMap},
+    ops::Bound,
+    result::Result as SResult,
+    time::Duration,
 };
 
 use anyhow::{bail, Result};
+use csnmp::{ObjectIdentifier, ObjectValue};
+use serde::de::{Error, Unexpected};
+use serde::Deserialize;
+use serde::{de::value::MapDeserializer, Deserializer};
+use serde_repr::Deserialize_repr;
 
-#[derive(Debug)]
-pub struct OidTreeEntry {
-    id: u64,
-    value: u32,
-    parent: Option<u64>,
-    name: Option<String>,
-    root: bool,
-}
-
-#[derive(Debug)]
-pub struct OidTree {
-    next_id: u64,
-    nodes: Vec<OidTreeEntry>,
-}
+pub mod mib;
+pub mod oidtree;
 
 #[derive(Debug, PartialEq)]
 pub enum IfOperStatus {
@@ -34,9 +29,7 @@ pub enum IfOperStatus {
 impl TryFrom<csnmp::ObjectValue> for IfOperStatus {
     type Error = anyhow::Error;
 
-    fn try_from(
-        value: csnmp::ObjectValue,
-    ) -> std::result::Result<Self, Self::Error> {
+    fn try_from(value: csnmp::ObjectValue) -> SResult<Self, Self::Error> {
         if !value.is_integer() {
             bail!("not an integer");
         }
@@ -68,9 +61,7 @@ pub enum IfAdminStatus {
 impl TryFrom<csnmp::ObjectValue> for IfAdminStatus {
     type Error = anyhow::Error;
 
-    fn try_from(
-        value: csnmp::ObjectValue,
-    ) -> std::result::Result<Self, Self::Error> {
+    fn try_from(value: csnmp::ObjectValue) -> SResult<Self, Self::Error> {
         if !value.is_integer() {
             bail!("not an integer");
         }
@@ -100,9 +91,7 @@ pub enum IfType {
 impl TryFrom<csnmp::ObjectValue> for IfType {
     type Error = anyhow::Error;
 
-    fn try_from(
-        value: csnmp::ObjectValue,
-    ) -> std::result::Result<Self, Self::Error> {
+    fn try_from(value: csnmp::ObjectValue) -> SResult<Self, Self::Error> {
         if !value.is_integer() {
             bail!("not an integer");
         }
@@ -121,352 +110,774 @@ impl TryFrom<csnmp::ObjectValue> for IfType {
     }
 }
 
-impl OidTree {
-    fn new() -> OidTree {
-        OidTree { next_id: 1000, nodes: Default::default() }
-    }
+fn populate_mib() -> Result<oidtree::OidTree> {
+    let mut tree = mib::populate_base()?;
 
-    pub fn oid_by_name(&self, name: &str) -> Result<Vec<u32>> {
-        let t = name.split(".").collect::<Vec<_>>();
-        if t.is_empty() {
-            bail!("what?")
-        }
+    mib::populate_mib2(&mut tree)?;
+    mib::cisco::populate(&mut tree)?;
+    mib::apc::populate(&mut tree)?;
 
-        /*
-         * First, find a root entry in the tree with this name:
-         */
-        let root = self
-            .nodes
-            .iter()
-            .find(|n| n.root && n.name.as_deref() == Some(t[0]));
-        let Some(root) = root else {
-            bail!("could not find root node {:?}", t[0]);
-        };
+    Ok(tree)
+}
 
-        /*
-         * Now, walk down the tree we've been provided and match nodes.
-         */
-        let mut prior = root;
-        for &tt in t.iter().skip(1) {
-            let next = self.nodes.iter().find(|n| {
-                !n.root
-                    && n.name.as_deref() == Some(tt)
-                    && n.parent == Some(prior.id)
-            });
+struct ObjectValueWrap(ObjectValue);
 
-            if let Some(next) = next {
-                prior = next;
-            } else {
-                bail!("could not find {tt:?}");
-            }
-        }
+impl<'de> serde::de::IntoDeserializer<'de> for ObjectValueWrap {
+    type Deserializer = ObjectValueDeserializer;
 
-        /*
-         * Make the numeric oid by walking back up:
-         */
-        let mut out = Vec::new();
-        loop {
-            out.push(prior.value);
-            if let Some(next) = prior.parent {
-                prior = self.nodes.iter().find(|n| n.id == next).unwrap();
-            } else {
-                break;
-            }
-        }
-
-        out.reverse();
-        Ok(out)
-    }
-
-    pub fn oid_name(&self, oid: &[u32]) -> Result<String> {
-        /*
-         * Try to find an oid entry for this oid.
-         */
-        let mut n = oid.len();
-        let mut out = Vec::new();
-        let mut anchor = loop {
-            if n == 0 {
-                /*
-                 * We give up.
-                 */
-                bail!("cannot do it");
-            }
-
-            if let Ok(ent) = self.find_oid(&oid[0..n]) {
-                /*
-                 * Found an anchor!
-                 */
-                break ent;
-            } else {
-                out.push(oid[n - 1].to_string());
-                n -= 1;
-            }
-        };
-
-        loop {
-            if let Some(name) = anchor.name.as_deref() {
-                out.push(name.to_string());
-            } else {
-                out.push(anchor.value.to_string());
-            }
-
-            if anchor.root {
-                break;
-            }
-
-            if let Some(parent) = anchor.parent {
-                anchor = self.nodes.iter().find(|n| n.id == parent).unwrap();
-            } else {
-                break;
-            }
-        }
-
-        out.reverse();
-        Ok(out.join("."))
-    }
-
-    fn find_oid(&self, oid: &[u32]) -> Result<&OidTreeEntry> {
-        let mut prior = None;
-        for &e in oid {
-            let next =
-                self.nodes.iter().find(|n| n.parent == prior && n.value == e);
-
-            prior = Some(if let Some(next) = next {
-                next.id
-            } else {
-                bail!("could not find oid {oid:?}");
-            });
-        }
-        Ok(self.nodes.iter().find(|n| n.id == prior.unwrap()).unwrap())
-    }
-
-    fn find_oid_mut(&mut self, oid: &[u32]) -> Result<&mut OidTreeEntry> {
-        let mut prior = None;
-        for &e in oid {
-            let next =
-                self.nodes.iter().find(|n| n.parent == prior && n.value == e);
-
-            prior = Some(if let Some(next) = next {
-                next.id
-            } else {
-                bail!("could not find oid {oid:?}");
-            });
-        }
-        Ok(self.nodes.iter_mut().find(|n| n.id == prior.unwrap()).unwrap())
-    }
-
-    pub fn add_oid_under(
-        &mut self,
-        parent: &[u32],
-        oid: &[u32],
-        name: &str,
-    ) -> Result<Vec<u32>> {
-        if oid.is_empty() || name.is_empty() {
-            bail!("that wont work");
-        }
-
-        /*
-         * Populate down the tree to the node we want to name.
-         */
-        let mut prior = Some(self.find_oid(parent)?.id);
-        for &e in oid {
-            let next = self
-                .nodes
-                .iter_mut()
-                .find(|n| n.parent == prior && n.value == e);
-
-            prior = Some(if let Some(next) = next {
-                next.id
-            } else {
-                let id = self.next_id;
-                self.next_id += 1;
-
-                self.nodes.push(OidTreeEntry {
-                    id,
-                    value: e,
-                    parent: prior,
-                    name: None,
-                    root: false,
-                });
-                id
-            });
-        }
-
-        /*
-         * Now that we're sure everything is there, locate the right node.
-         */
-        let mut full_oid = parent.to_vec();
-        full_oid.extend(oid.to_vec());
-
-        let ent = self.find_oid_mut(&full_oid).unwrap();
-        ent.root = false;
-        ent.name = Some(name.to_string());
-
-        Ok(full_oid)
-    }
-
-    pub fn add_oid_root(
-        &mut self,
-        oid: &[u32],
-        name: &str,
-    ) -> Result<Vec<u32>> {
-        if oid.is_empty() || name.is_empty() {
-            bail!("that wont work");
-        }
-
-        /*
-         * Populate down the tree to the node we want to name.
-         */
-        let mut prior = None;
-        for &e in oid {
-            let next = self
-                .nodes
-                .iter_mut()
-                .find(|n| n.parent == prior && n.value == e);
-
-            prior = Some(if let Some(next) = next {
-                next.id
-            } else {
-                let id = self.next_id;
-                self.next_id += 1;
-
-                self.nodes.push(OidTreeEntry {
-                    id,
-                    value: e,
-                    parent: prior,
-                    name: None,
-                    root: false,
-                });
-                id
-            });
-        }
-
-        /*
-         * Now that we're sure everything is there, locate the right node.
-         */
-        let ent = self.find_oid_mut(oid).unwrap();
-        ent.root = true;
-        ent.name = Some(name.to_string());
-
-        Ok(oid.to_vec())
+    fn into_deserializer(self) -> Self::Deserializer {
+        ObjectValueDeserializer(self.0.clone())
     }
 }
 
-fn populate_mib() -> Result<OidTree> {
-    let mut tree = OidTree::new();
-    let internet = tree.add_oid_root(&[1, 3, 6, 1], "internet")?;
-    let mgmt = tree.add_oid_under(&internet, &[2], "mgmt")?;
-    let mib_2 = tree.add_oid_under(&mgmt, &[1], "mib-2")?;
-    let interfaces = tree.add_oid_under(&mib_2, &[2], "interfaces")?;
-    #[allow(unused)]
-    let if_number = tree.add_oid_under(&interfaces, &[1], "ifNumber")?;
-    let if_table = tree.add_oid_under(&interfaces, &[2], "ifTable")?;
-    let if_entry = tree.add_oid_under(&if_table, &[1], "ifEntry")?;
+struct ObjectValueDeserializer(ObjectValue);
 
-    for (idx, entry_name) in [
-        "ifIndex",
-        "ifDescr",
-        "ifType",
-        "ifMtu",
-        "ifSpeed",
-        "ifPhysAddress",
-        "ifAdminStatus",
-        "ifOperStatus",
-        "ifLastChange",
-        "ifInOctets",
-        "ifInUcastPkts",
-        "ifInNUcastPkts",
-        "ifInDiscards",
-        "ifInErrors",
-        "ifInUnknownProtos",
-        "ifOutOctets",
-        "ifOutUcastPkts",
-        "ifOutNUcastPkts",
-        "ifOutDiscards",
-        "ifOutErrors",
-        "ifOutQLen",
-        "ifSpecific",
-    ]
-    .iter()
-    .enumerate()
-    {
-        let idx: u32 = idx.try_into().unwrap();
-        tree.add_oid_under(&if_entry, &[idx + 1], entry_name)?;
+impl ObjectValueDeserializer {
+    fn as_u64(&self) -> SResult<u64, serde::de::value::Error> {
+        match &self.0 {
+            ObjectValue::Integer(i) => {
+                if *i < 0 {
+                    Err(serde::de::value::Error::invalid_value(
+                        Unexpected::Signed(*i as i64),
+                        &"a u32",
+                    ))
+                } else {
+                    Ok((*i).try_into().unwrap())
+                }
+            }
+
+            ObjectValue::Counter32(u)
+            | ObjectValue::Unsigned32(u)
+            | ObjectValue::TimeTicks(u) => Ok((*u).into()),
+
+            ObjectValue::Counter64(u) => Ok(*u),
+
+            _ => Err(serde::de::value::Error::invalid_value(
+                Unexpected::Other("other SNMP type"),
+                &"a u64",
+            )),
+        }
     }
 
-    let private = tree.add_oid_under(&internet, &[4], "private")?;
-    let enterprises = tree.add_oid_under(&private, &[1], "enterprises")?;
+    fn as_i64(&self) -> SResult<i64, serde::de::value::Error> {
+        match &self.0 {
+            ObjectValue::Integer(i) => Ok((*i).into()),
+
+            ObjectValue::Counter32(u)
+            | ObjectValue::Unsigned32(u)
+            | ObjectValue::TimeTicks(u) => Ok((*u).into()),
+
+            ObjectValue::Counter64(u) => {
+                let v: i64 = (*u).try_into().map_err(|_| {
+                    serde::de::value::Error::invalid_value(
+                        Unexpected::Unsigned(*u),
+                        &"an i64",
+                    )
+                })?;
+
+                Ok(v)
+            }
+
+            _ => Err(serde::de::value::Error::invalid_value(
+                Unexpected::Other("other SNMP type"),
+                &"an i64",
+            )),
+        }
+    }
+}
+
+impl<'de> Deserializer<'de> for ObjectValueDeserializer {
+    type Error = serde::de::value::Error;
+
+    fn deserialize_any<V>(self, v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        match &self.0 {
+            ObjectValue::Integer(_) => self.deserialize_i32(v),
+            ObjectValue::String(_) => self.deserialize_str(v),
+            ObjectValue::ObjectId(_) => self.deserialize_seq(v),
+            ObjectValue::Counter32(_)
+            | ObjectValue::Unsigned32(_)
+            | ObjectValue::TimeTicks(_) => self.deserialize_u32(v),
+            ObjectValue::Counter64(_) => self.deserialize_u64(v),
+            ObjectValue::IpAddress(_) | ObjectValue::Opaque(_) => {
+                self.deserialize_bytes(v)
+            }
+        }
+    }
+
+    fn deserialize_bool<V>(self, _v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::value::Error::custom("no bool support"))
+    }
+
+    fn deserialize_i8<V>(self, v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.deserialize_i64(v)
+    }
+
+    fn deserialize_i16<V>(self, v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.deserialize_i64(v)
+    }
+
+    fn deserialize_i32<V>(self, v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.deserialize_i64(v)
+    }
+
+    fn deserialize_i64<V>(self, v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        v.visit_i64(self.as_i64()?)
+    }
+
+    fn deserialize_u8<V>(self, v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.deserialize_u64(v)
+    }
+
+    fn deserialize_u16<V>(self, v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.deserialize_u64(v)
+    }
+
+    fn deserialize_u32<V>(self, v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.deserialize_u64(v)
+    }
+
+    fn deserialize_u64<V>(self, v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        v.visit_u64(self.as_u64()?)
+    }
+
+    fn deserialize_f32<V>(self, _v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::value::Error::custom("no f32 support"))
+    }
+
+    fn deserialize_f64<V>(self, _v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::value::Error::custom("no f64 support"))
+    }
+
+    fn deserialize_char<V>(self, _v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::value::Error::custom("no char support"))
+    }
+
+    fn deserialize_str<V>(self, v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        match &self.0 {
+            ObjectValue::String(buf) => {
+                v.visit_str(std::str::from_utf8(buf).map_err(|_| {
+                    serde::de::value::Error::invalid_value(
+                        Unexpected::Bytes(buf),
+                        &"a valid UTF-8 string",
+                    )
+                })?)
+            }
+            _ => Err(serde::de::value::Error::invalid_value(
+                Unexpected::Other("other SNMP value"),
+                &"a valid UTF-8 string",
+            )),
+        }
+    }
+
+    fn deserialize_string<V>(self, v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.deserialize_str(v)
+    }
+
+    fn deserialize_bytes<V>(self, v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        match &self.0 {
+            ObjectValue::String(buf) | ObjectValue::Opaque(buf) => {
+                v.visit_bytes(buf)
+            }
+            _ => Err(serde::de::value::Error::invalid_value(
+                Unexpected::Other("other SNMP value"),
+                &"an opaque or a string",
+            )),
+        }
+    }
+
+    fn deserialize_byte_buf<V>(self, v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.deserialize_bytes(v)
+    }
+
+    fn deserialize_option<V>(self, _v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::value::Error::custom("no option support"))
+    }
+
+    fn deserialize_unit<V>(self, _v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::value::Error::custom("no unit support"))
+    }
+
+    fn deserialize_unit_struct<V>(
+        self,
+        _name: &'static str,
+        _v: V,
+    ) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::value::Error::custom("no unit struct support"))
+    }
+
+    fn deserialize_newtype_struct<V>(
+        self,
+        _name: &'static str,
+        _v: V,
+    ) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::value::Error::custom("no newtype struct support"))
+    }
+
+    fn deserialize_seq<V>(self, _v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::value::Error::custom("no seq support"))
+    }
+
+    fn deserialize_tuple<V>(
+        self,
+        _len: usize,
+        _v: V,
+    ) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::value::Error::custom("no tuple support"))
+    }
+
+    fn deserialize_tuple_struct<V>(
+        self,
+        _name: &'static str,
+        _len: usize,
+        _v: V,
+    ) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::value::Error::custom("no tuple struct support"))
+    }
+
+    fn deserialize_map<V>(self, _v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::value::Error::custom("no map support"))
+    }
+
+    fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        _fields: &'static [&'static str],
+        _v: V,
+    ) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::value::Error::custom("no struct support"))
+    }
+
+    fn deserialize_enum<V>(
+        self,
+        _name: &'static str,
+        _variants: &'static [&'static str],
+        _v: V,
+    ) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::value::Error::custom("no enum support"))
+    }
+
+    fn deserialize_identifier<V>(self, _v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        Err(serde::de::value::Error::custom("no identifier support"))
+    }
+
+    fn deserialize_ignored_any<V>(self, v: V) -> SResult<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.deserialize_any(v)
+    }
+}
+
+impl std::fmt::Debug for ObjectValueWrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            ObjectValue::Integer(i) => format_args!("{}", i).fmt(f),
+            ObjectValue::String(vu) => {
+                format_args!("{:?}", String::from_utf8_lossy(vu)).fmt(f)
+            }
+            ObjectValue::ObjectId(oid) => format_args!("<oid:{oid}>").fmt(f),
+            ObjectValue::IpAddress(ip) => format_args!("{}", ip).fmt(f),
+            ObjectValue::Counter32(u) => format_args!("{}", u).fmt(f),
+            ObjectValue::Unsigned32(u) => format_args!("{}", u).fmt(f),
+            ObjectValue::TimeTicks(u) => format_args!("{}", u).fmt(f),
+            ObjectValue::Opaque(buf) => format_args!("{:?}", buf).fmt(f),
+            ObjectValue::Counter64(u) => format_args!("{}", u).fmt(f),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+#[allow(unused)]
+struct Ident {
+    index: u32,
+    module: u32,
+    name: String,
+    location: String,
+    hardware_rev: String,
+    firmware_rev: String,
+    date_of_manufacture: String,
+    model_number: String,
+    serial_number: String,
+    contact: String,
+    boot_monitor_rev: String,
+    long_description: String,
+    #[serde(rename = "NMCSerialNumber")]
+    nmc_serial_number: String,
+    app_build_date: String,
+    #[serde(rename = "AOSBuildDate")]
+    aos_build_date: String,
+    boot_mon_build_date: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+#[allow(unused)]
+struct BankConfiguration {
+    index: u32,
+    module: u32,
+    number: u32,
+    overload_restriction: OverloadRestriction,
+    low_load_current_threshold: u32,
+    near_overload_current_threshold: u32,
+    overload_current_threshold: u32,
+    bank_peak_current_reset: PeakCurrentReset,
+}
+
+#[derive(Deserialize_repr, PartialEq, Eq, Debug)]
+#[repr(i32)]
+enum OverloadRestriction {
+    AlwaysAllowTurnOn = 1,
+    RestrictOnNearOverload = 2,
+    RestrictOnOverload = 3,
+    NotSupported = 4,
+}
+
+#[derive(Deserialize_repr, PartialEq, Eq, Debug)]
+#[repr(i32)]
+enum PeakCurrentReset {
+    NoOperation = 1,
+    Reset = 2,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+#[allow(unused)]
+struct BankProperties {
+    index: u32,
+    module: u32,
+    number: u32,
+    phase_layout: PhaseLayoutType,
+    breaker_rating: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+#[allow(unused)]
+struct BankStatus {
+    index: u32,
+    module: u32,
+    number: u32,
+    load_state: LoadState,
+    current: u32,
+    peak_current: u32,
+    peak_current_timestamp: String,
+    peak_current_start_time: String,
+}
+
+#[derive(Deserialize_repr, PartialEq, Eq, Debug)]
+#[repr(i32)]
+enum LoadState {
+    LowLoad = 1,
+    Normal = 2,
+    NearOverload = 3,
+    Overload = 4,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+#[allow(unused)]
+struct OutletControl {
+    index: u32,
+    module: u32,
+    name: String,
+    number: u32,
+    command: OutletCommand,
+}
+
+#[derive(Deserialize_repr, PartialEq, Eq, Debug)]
+#[repr(i32)]
+enum OutletCommand {
+    ImmediateOn = 1,
+    ImmediateOff = 2,
+    ImmediateReboot = 3,
+    OutletUnknown = 4,
+    DelayedOn = 5,
+    DelayedOff = 6,
+    DelayedReboot = 7,
+    CancelPendingCommand = 8,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+#[allow(unused)]
+struct OutletConfig {
+    index: u32,
+    module: u32,
+    name: String,
+    number: u32,
+    power_on_time: i32,
+    power_off_time: i32,
+    reboot_duration: u32,
+    external_link: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+#[allow(unused)]
+struct OutletProperties {
+    index: u32,
+    module: u32,
+    name: String,
+    number: u32,
+
+    phase_layout: PhaseLayoutType,
+    bank: u32,
+}
+
+#[derive(Deserialize_repr, PartialEq, Eq, Debug)]
+#[repr(i32)]
+enum PhaseLayoutType {
+    Phase1ToNeutral = 1,
+    Phase2ToNeutral = 2,
+    Phase3ToNeutral = 3,
+    Phase1ToPhase2 = 4,
+    Phase2ToPhase3 = 5,
+    Phase3ToPhase1 = 6,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+#[allow(unused)]
+struct OutletStatus {
+    index: u32,
+    module: u32,
+    name: String,
+    number: u32,
+
+    state: State,
+    command_pending: CommandPending,
+    external_link: String,
+}
+
+#[derive(Deserialize_repr, PartialEq, Eq, Debug)]
+#[repr(i32)]
+enum CommandPending {
+    Yes = 1,
+    No = 2,
+    Unknown = 3,
+}
+
+#[derive(Deserialize_repr, PartialEq, Eq, Debug)]
+#[repr(i32)]
+enum State {
+    Off = 1,
+    On = 2,
+}
+
+fn table_entry_range(
+    oid: ObjectIdentifier,
+) -> (Bound<ObjectIdentifier>, Bound<ObjectIdentifier>) {
+    let last_id = *oid.as_slice().iter().last().unwrap();
+    let one_after =
+        oid.parent().unwrap().child(last_id.checked_add(1).unwrap()).unwrap();
+    (std::ops::Bound::Included(oid), std::ops::Bound::Excluded(one_after))
+}
+
+fn extract_table<T>(
+    tree: &oidtree::OidTree,
+    res: &BTreeMap<ObjectIdentifier, ObjectValue>,
+    table_size: ObjectIdentifier,
+    table_entry: ObjectIdentifier,
+    strip_name_prefix: &str,
+) -> Result<BTreeMap<u32, T>>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    /*
+     * Get the size of the table from the results:
+     */
+    let Some(size) = res.get(&table_size.child(0).unwrap()) else {
+        bail!("could not locate table size at {table_size})");
+    };
+
+    let size = match size {
+        ObjectValue::Integer(i) => {
+            if *i < 0 {
+                bail!("negative size {i} at {table_size}");
+            }
+
+            *i as u32
+        }
+        other => bail!("invalid size {other:?} at {table_size}"),
+    };
 
     /*
-     * Cisco bullshit:
+     * Collect entries from the table:
      */
-    let switch001 =
-        tree.add_oid_under(&enterprises, &[9, 6, 1, 101], "switch001")?;
-    let sw_interfaces =
-        tree.add_oid_under(&switch001, &[43], "swInterfaces")?;
-    let sw_if_table = tree.add_oid_under(&sw_interfaces, &[1], "swIfTable")?;
-    let sw_if_entry = tree.add_oid_under(&sw_if_table, &[1], "swIfTable")?;
+    let mut out: BTreeMap<u32, HashMap<String, ObjectValueWrap>> =
+        BTreeMap::new();
+    for (oid, val) in res.range(table_entry_range(table_entry)) {
+        let rel =
+            oid.relative_to(&table_entry).expect("must be a child of oid");
+        if rel.len() != 2 || rel.as_slice()[1] == 0 {
+            bail!("unusual table structure: {rel} under {oid}?");
+        }
 
-    for (idx, entry_name) in [
-        "swIfIndex",
-        "swIfPhysAddressType",
-        "swIfDuplexAdminMode",
-        "swIfDuplexOperMode",
-        "swIfBackPressureMode",
-        "swIfTaggedMode",
-        "swIfTransceiverType",
-        "swIfLockAdminStatus",
-        "swIfLockOperStatus",
-        "swIfType",
-        "swIfDefaultTag",
-        "swIfDefaultPriority",
-        "swIfAdminStatus",
-        "swIfFlowControlMode",
-        "swIfSpeedAdminMode",
-        "swIfSpeedDuplexAutoNegotiation",
-        "swIfOperFlowControlMode",
-        "swIfOperSpeedDuplexAutoNegotiation",
-        "swIfOperBackPressureMode",
-        "swIfAdminLockAction",
-        "swIfOperLockAction",
-        "swIfAdminLockTrapEnable",
-        "swIfOperLockTrapEnable",
-        "swIfOperSuspendedStatus",
-        "swIfLockOperTrapCount",
-        "swIfLockAdminTrapFrequency",
-        "swIfReActivate",
-        "swIfAdminMdix",
-        "swIfOperMdix",
-        "swIfHostMode",
-        "swIfSingleHostViolationAdminAction",
-        "swIfSingleHostViolationOperAction",
-        "swIfSingleHostViolationAdminTrapEnable",
-        "swIfSingleHostViolationOperTrapEnable",
-        "swIfSingleHostViolationOperTrapCount",
-        "swIfSingleHostViolationAdminTrapFrequency",
-        "swIfLockLimitationMode",
-        "swIfLockMaxMacAddresses",
-        "swIfLockMacAddressesCount",
-        "swIfAdminSpeedDuplexAutoNegotiationLocalCapabilities",
-        "swIfOperSpeedDuplexAutoNegotiationLocalCapabilities",
-        "swIfSpeedDuplexNegotiationRemoteCapabilities",
-        "swIfAdminComboMode",
-        "swIfOperComboMode",
-        "swIfAutoNegotiationMasterSlavePreference",
-        "swIfPortCapabilities",
-        "swIfPortStateDuration",
-        "swIfApNegotiationLane",
-        "swIfPortFecMode",
-        "swIfPortNumOfLanes",
-    ]
-    .iter()
-    .enumerate()
-    {
-        let idx: u32 = idx.try_into().unwrap();
-        tree.add_oid_under(&sw_if_entry, &[idx + 1], entry_name)?;
+        let n = tree.oid_name(&oid.parent().unwrap())?;
+        let Some(n) = n.basename().strip_prefix(strip_name_prefix) else {
+            bail!("name {n} not prefixed with {strip_name_prefix:?}");
+        };
+
+        let i = rel.as_slice()[1];
+        let map = out.entry(i).or_default();
+        if map.insert(n.to_string(), ObjectValueWrap(val.clone())).is_some() {
+            bail!("duplicate {n:?}[{i}] value?");
+        }
     }
 
-    Ok(tree)
+    for i in 1..=size {
+        if !out.contains_key(&i) {
+            bail!("table is missing index {i}?");
+        }
+    }
+
+    /*
+     * Deserialise the results!
+     */
+    Ok(out
+        .into_iter()
+        .map(|(idx, map)| {
+            Ok((idx, T::deserialize(MapDeserializer::new(map.into_iter()))?))
+        })
+        .collect::<Result<_>>()?)
+}
+
+struct RPdu2<'a>(&'a oidtree::OidTree, BTreeMap<ObjectIdentifier, ObjectValue>);
+
+impl<'a> RPdu2<'a> {
+    fn top(&'a self) -> Result<ObjectIdentifier> {
+        self.0.oid_by_name(
+            "internet.private.enterprises.apc.products.hardware.rPDU2",
+        )
+    }
+
+    pub fn ident(&'a self) -> Result<BTreeMap<u32, Ident>> {
+        let top = self.top()?;
+
+        extract_table(
+            self.0,
+            &self.1,
+            self.0.oid_by_name_under(&top, "rPDU2IdentTableSize")?,
+            self.0
+                .oid_by_name_under(&top, "rPDU2IdentTable.rPDU2IdentEntry")?,
+            "rPDU2Ident",
+        )
+    }
+
+    pub fn bank_config(&'a self) -> Result<BTreeMap<u32, BankConfiguration>> {
+        let top = self.top()?;
+
+        extract_table(
+            self.0,
+            &self.1,
+            self.0.oid_by_name_under(&top, "rPDU2BankTableSize")?,
+            self.0.oid_by_name_under(
+                &top,
+                "rPDU2Bank.rPDU2BankConfigTable.rPDU2BankConfigEntry",
+            )?,
+            "rPDU2BankConfig",
+        )
+    }
+
+    pub fn bank_props(&'a self) -> Result<BTreeMap<u32, BankProperties>> {
+        let top = self.top()?;
+
+        extract_table(
+            self.0,
+            &self.1,
+            self.0.oid_by_name_under(&top, "rPDU2BankTableSize")?,
+            self.0.oid_by_name_under(
+                &top,
+                "rPDU2Bank.rPDU2BankPropertiesTable.rPDU2BankPropertiesEntry",
+            )?,
+            "rPDU2BankProperties",
+        )
+    }
+
+    pub fn bank_status(&'a self) -> Result<BTreeMap<u32, BankStatus>> {
+        let top = self.top()?;
+
+        extract_table(
+            self.0,
+            &self.1,
+            self.0.oid_by_name_under(&top, "rPDU2BankTableSize")?,
+            self.0.oid_by_name_under(
+                &top,
+                "rPDU2Bank.rPDU2BankStatusTable.rPDU2BankStatusEntry",
+            )?,
+            "rPDU2BankStatus",
+        )
+    }
+
+    pub fn outlet_control(&'a self) -> Result<BTreeMap<u32, OutletControl>> {
+        let top = self.top()?;
+
+        extract_table(
+            self.0,
+            &self.1,
+            self.0.oid_by_name_under(
+                &top,
+                "rPDU2Outlet.rPDU2OutletSwitchedTableSize",
+            )?,
+            self.0.oid_by_name_under(
+                &top,
+                "rPDU2Outlet.\
+                    rPDU2OutletSwitched.\
+                    rPDU2OutletSwitchedControlTable.\
+                    rPDU2OutletSwitchedControlEntry",
+            )?,
+            "rPDU2OutletSwitchedControl",
+        )
+    }
+
+    pub fn outlet_config(&'a self) -> Result<BTreeMap<u32, OutletConfig>> {
+        let top = self.top()?;
+
+        extract_table(
+            self.0,
+            &self.1,
+            self.0.oid_by_name_under(
+                &top,
+                "rPDU2Outlet.rPDU2OutletSwitchedTableSize",
+            )?,
+            self.0.oid_by_name_under(
+                &top,
+                "rPDU2Outlet.\
+                    rPDU2OutletSwitched.\
+                    rPDU2OutletSwitchedConfigTable.\
+                    rPDU2OutletSwitchedConfigEntry",
+            )?,
+            "rPDU2OutletSwitchedConfig",
+        )
+    }
+
+    pub fn outlet_props(&'a self) -> Result<BTreeMap<u32, OutletProperties>> {
+        let top = self.top()?;
+
+        extract_table(
+            self.0,
+            &self.1,
+            self.0.oid_by_name_under(
+                &top,
+                "rPDU2Outlet.rPDU2OutletSwitchedTableSize",
+            )?,
+            self.0.oid_by_name_under(
+                &top,
+                "rPDU2Outlet.\
+                    rPDU2OutletSwitched.\
+                    rPDU2OutletSwitchedPropertiesTable.\
+                    rPDU2OutletSwitchedPropertiesEntry",
+            )?,
+            "rPDU2OutletSwitchedProperties",
+        )
+    }
+
+    pub fn outlet_status(&'a self) -> Result<BTreeMap<u32, OutletStatus>> {
+        let top = self.top()?;
+
+        extract_table(
+            self.0,
+            &self.1,
+            self.0.oid_by_name_under(
+                &top,
+                "rPDU2Outlet.rPDU2OutletSwitchedTableSize",
+            )?,
+            self.0.oid_by_name_under(
+                &top,
+                "rPDU2Outlet.\
+                    rPDU2OutletSwitched.\
+                    rPDU2OutletSwitchedStatusTable.\
+                    rPDU2OutletSwitchedStatusEntry",
+            )?,
+            "rPDU2OutletSwitchedStatus",
+        )
+    }
+
 }
 
 #[tokio::main]
@@ -477,13 +888,13 @@ async fn main() -> Result<()> {
         .parse(std::env::args().skip(1))?;
 
     if a.free.len() != 1 {
-        bail!("IP address of switch?");
+        bail!("IP address of SNMP target?");
     }
 
-    let verbose = a.opt_present("v");
+    let _verbose = a.opt_present("v");
 
     let addr: std::net::IpAddr = a.free[0].parse()?;
-    println!("using switch address {addr}");
+    println!("using target address {addr}");
 
     let bind = match &addr {
         std::net::IpAddr::V4(_) => "0.0.0.0:0",
@@ -492,38 +903,11 @@ async fn main() -> Result<()> {
 
     let tree = populate_mib()?;
 
-    /*
-     * We want the interface table:
-     */
-    let top_oid = csnmp::ObjectIdentifier::try_from(
-        tree.oid_by_name("internet.mgmt.mib-2.interfaces.ifTable")?.as_slice(),
-    )?;
-    let name = tree.oid_name(top_oid.as_slice())?;
+    let base = "internet.private.enterprises.apc.products.hardware.rPDU2";
+    let top = tree.oid_by_name(base)?;
+    let name = tree.oid_name(&top)?;
 
-    /*
-     * We also want to be able to identify specific entries from within the
-     * table by prefix:
-     */
-    let if_type = csnmp::ObjectIdentifier::try_from(
-        tree.oid_by_name(
-            "internet.mgmt.mib-2.interfaces.ifTable.ifEntry.ifType",
-        )?
-        .as_slice(),
-    )?;
-    let if_oper_status = csnmp::ObjectIdentifier::try_from(
-        tree.oid_by_name(
-            "internet.mgmt.mib-2.interfaces.ifTable.ifEntry.ifOperStatus",
-        )?
-        .as_slice(),
-    )?;
-    let if_descr = csnmp::ObjectIdentifier::try_from(
-        tree.oid_by_name(
-            "internet.mgmt.mib-2.interfaces.ifTable.ifEntry.ifDescr",
-        )?
-        .as_slice(),
-    )?;
-
-    println!("top oid = {name:?} -> {top_oid}");
+    println!("top oid = {name} -> {top}");
 
     println!("creating client...");
     let c = csnmp::Snmp2cClient::new(
@@ -534,98 +918,33 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    println!("walking from {name:?} ({top_oid}) ...");
+    println!("walking from {name} ({top}) ...");
 
-    fn blank_map() -> BTreeMap<u32, Option<IfOperStatus>> {
-        (1u32..=16).map(|port| (port, None)).collect()
-    }
+    let res = RPdu2(&tree, c.walk_bulk(top, 0, 63).await?);
 
-    let mut oldmap = blank_map();
+    let outlet_status = res.outlet_status()?;
+    println!("outlet_status = {outlet_status:#?}");
 
-    loop {
-        let start = Instant::now();
-        let res = c.walk_bulk(top_oid, 0, 63).await?;
-        let mut link_states: BTreeMap<u32, IfOperStatus> = Default::default();
-        let mut link_desc: BTreeMap<u32, String> = Default::default();
-        let mut link_types: BTreeMap<u32, IfType> = Default::default();
-        for (oid, val) in res {
-            if let Some(rel) = oid.relative_to(&if_type) {
-                let idx = rel.as_slice()[0];
-                let ift = IfType::try_from(val)?;
-                link_types.insert(idx, ift);
-            } else if let Some(rel) = oid.relative_to(&if_oper_status) {
-                let idx = rel.as_slice()[0];
-                let ifs = IfOperStatus::try_from(val)?;
-                link_states.insert(idx, ifs);
-            } else if let Some(rel) = oid.relative_to(&if_descr) {
-                let idx = rel.as_slice()[0];
-                link_desc.insert(
-                    idx,
-                    String::from_utf8_lossy(val.as_bytes().unwrap())
-                        .to_string(),
-                );
-            }
-        }
+    let outlet_props = res.outlet_props()?;
+    println!("outlet_props = {outlet_props:#?}");
 
-        /*
-         * We only care about the copper gigabit ports right now.  Start with an
-         * unknown state for each of them:
-         */
-        let mut map = blank_map();
+    let outlet_config = res.outlet_config()?;
+    println!("outlet_config = {outlet_config:#?}");
 
-        /*
-         * Look at what we actually got back from the switch and update the map.
-         */
-        if verbose {
-            println!("{:<20} {}", "PORT", "STATE");
-        }
-        for (idx, st) in link_states {
-            let Some(desc) = link_desc.get(&idx) else { continue; };
-            let Some(ltype) = link_types.get(&idx) else { continue; };
+    let outlet_control = res.outlet_control()?;
+    println!("outlet_control = {outlet_control:#?}");
 
-            if !matches!(ltype, IfType::EthernetCsmacd) {
-                continue;
-            }
+    let ident = res.ident()?;
+    println!("ident = {ident:#?}");
 
-            let Some(port) = desc.strip_prefix("GigabitEthernet") else {
-                continue;
-            };
-            let Ok(port) = port.parse::<u32>() else { continue; };
+    let bank_status = res.bank_status()?;
+    println!("bank_status = {bank_status:#?}");
 
-            if verbose {
-                println!("{:<20} {:?}", desc, st);
-            }
+    let bank_props = res.bank_props()?;
+    println!("bank_props = {bank_props:#?}");
 
-            map.insert(port, Some(st));
-        }
+    let bank_config = res.bank_config()?;
+    println!("bank_config = {bank_config:#?}");
 
-        if verbose {
-            println!("{map:#?}");
-
-            let delta =
-                Instant::now().saturating_duration_since(start).as_millis();
-            println!("    (took {delta}ms)");
-            println!();
-        }
-
-        let mut banner = false;
-
-        for port in 1u32..=16 {
-            let old = oldmap.get(&port).unwrap();
-            let new = map.get(&port).unwrap();
-
-            if old != new {
-                if !banner {
-                    println!("-------------------------");
-                    banner = true;
-                }
-
-                println!("{port:<2} {old:?} -> {new:?}");
-            }
-        }
-
-        oldmap = map;
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    Ok(())
 }
